@@ -169,6 +169,8 @@ struct Config {
     float noise_clamp = 0.0f;
     int lsd_steps = 1, num_threads = 0, first_chunk_frames = 1, max_chunk_frames = 15;
     int eos_extra_frames = -1;  // -1 = auto-calculate from text length
+    int max_tokens_per_chunk = 50;  // pack sentences up to this many tokens (matches upstream)
+    int lead_in_ms = 250;       // leading silence before the first audio chunk
     bool verbose = false;
     bool voice_cache = true;
 };
@@ -1762,6 +1764,39 @@ private:
         for (size_t i = 0; i < ids.size(); ++i) r.data[i] = ids[i];
         return r;
     }
+
+    // Pack sentences into generation chunks up to cfg_.max_tokens_per_chunk
+    // tokens, matching upstream pocket-tts: very short leading sentences
+    // ("Guten Tag!") must never be generated alone — tiny conditioned
+    // generations produce start artifacts (noise/music under the voice).
+    std::vector<std::string> pack_sentences(const std::vector<std::string>& sentences) {
+        if (cfg_.max_tokens_per_chunk <= 0 || sentences.size() <= 1) return sentences;
+        std::vector<std::string> chunks;
+        std::string cur;
+        size_t cur_count = 0;
+        for (const auto& s : sentences) {
+            size_t count = tok_->encode(s).size();
+            if (cur.empty()) {
+                cur = s;
+                cur_count = count;
+                continue;
+            }
+            if (cur_count + count > (size_t)cfg_.max_tokens_per_chunk) {
+                chunks.push_back(cur);
+                cur = s;
+                cur_count = count;
+            } else {
+                cur += " " + s;
+                cur_count += count;
+            }
+        }
+        if (!cur.empty()) chunks.push_back(cur);
+        if (cfg_.verbose) {
+            std::cerr << "  Packed " << sentences.size() << " sentence(s) into "
+                      << chunks.size() << " generation chunk(s)\n";
+        }
+        return chunks;
+    }
     
     // ── LatentGen ───────────────────────────────────────────────────────────
     // Autoregressive latent generator. Each call to next() runs the main
@@ -2030,6 +2065,7 @@ AudioData PocketTTS::generate(const std::string& text, const Tensor& voice, int 
     
     auto sentences = split_sentences(text);
     if (sentences.empty()) sentences.push_back(text);
+    sentences = pack_sentences(sentences);
     
     if (sentences.size() == 1) {
         std::vector<float> samples;
@@ -2084,6 +2120,7 @@ void PocketTTS::stream(const std::string& text, const std::string& voice, Stream
 void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallback cb, int max_frames) {
     auto sentences = split_sentences(text);
     if (sentences.empty()) sentences.push_back(text);
+    sentences = pack_sentences(sentences);
     
     for (size_t si = 0; si < sentences.size(); ++si) {
         auto [prepared, eos_extra] = prepare_text(sentences[si], cfg_.eos_extra_frames);
@@ -2124,6 +2161,9 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
         });
         
         bool first = true;
+        // Leading silence: protects the first phoneme from being clipped by
+        // playback pipelines that start consuming immediately (see lead_in_ms).
+        size_t lead_pad = (size_t)SR * (size_t)std::max(0, cfg_.lead_in_ms) / 1000;
         
         while (true) {
             int want = first ? cfg_.first_chunk_frames : cfg_.max_chunk_frames;
@@ -2154,7 +2194,19 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
                 size_t n = 1;
                 for (auto d : shape) n *= d;
                 
-                if (!cb(outputs[0].GetTensorData<float>(), n)) {
+                const float* out_data = outputs[0].GetTensorData<float>();
+                bool ok = true;
+                if (lead_pad && first) {
+                    // Prepend leading silence to the very first chunk so the
+                    // attack of the first phoneme survives playback start-up.
+                    std::vector<float> padded(lead_pad + n, 0.0f);
+                    std::memcpy(padded.data() + lead_pad, out_data, n * sizeof(float));
+                    ok = cb(padded.data(), padded.size());
+                    lead_pad = 0;
+                } else {
+                    ok = cb(out_data, n);
+                }
+                if (!ok) {
                     std::lock_guard<std::mutex> lock(mtx);
                     aborted = true;
                     break;
@@ -2825,6 +2877,8 @@ int main(int argc, char* argv[]) {
         else if (a == "--eos-threshold") cfg.eos_threshold = std::stof(next());
         else if (a == "--noise-clamp") cfg.noise_clamp = std::stof(next());
         else if (a == "--eos-extra") cfg.eos_extra_frames = std::stoi(next());
+        else if (a == "--lead-in-ms") cfg.lead_in_ms = std::stoi(next());
+        else if (a == "--max-chunk-tokens") cfg.max_tokens_per_chunk = std::stoi(next());
         else if (a == "--first-chunk") cfg.first_chunk_frames = std::stoi(next());
         else if (a == "--max-chunk") cfg.max_chunk_frames = std::stoi(next());
         else if (a == "--no-cache") cfg.voice_cache = false;
