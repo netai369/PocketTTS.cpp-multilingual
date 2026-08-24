@@ -992,7 +992,7 @@ def validate_flow_lm_main(model: TTSModel, onnx_dir: Path,
     import onnxruntime as ort
     max_seq = MAX_SEQ_LEN
     sess = ort.InferenceSession(str(onnx_dir / onnx_file))
-    N_LAYERS = 6
+    N_LAYERS = len(model.flow_lm.transformer.layers)
     results = []
 
     # Text conditioning pass
