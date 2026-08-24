@@ -284,7 +284,7 @@ class FlowLMMainWrapper(nn.Module):
       state_17: layer 5 step
     """
 
-    NUM_LAYERS = 6
+    NUM_LAYERS = 6  # class default; overridden per instance in __init__
     D_MODEL = 1024
     NUM_HEADS = 16
     DIM_PER_HEAD = 64
@@ -296,7 +296,9 @@ class FlowLMMainWrapper(nn.Module):
         self.input_linear = flow_lm.input_linear  # Linear(32, 1024, bias=False)
         self.out_norm = flow_lm.out_norm          # LayerNorm(1024)
         self.out_eos = flow_lm.out_eos            # Linear(1024, 1)
-        self.layers = flow_lm.transformer.layers  # 6 × StreamingTransformerLayer
+        self.layers = flow_lm.transformer.layers  # 6 (or 24 for *_24l) × StreamingTransformerLayer
+        # Respect the actual model depth so *_24l bundles export correctly.
+        self.NUM_LAYERS = len(self.layers)
 
     def _attention(self, attn: StreamingMultiheadAttention, x, cache_k, cache_v, step):
         """Run one attention layer with split K/V cache state (fp16).
@@ -412,7 +414,7 @@ def export_flow_lm_main(model: TTSModel, output_path: Path, max_seq=MAX_SEQ_LEN)
     for p in wrapper.parameters():
         p.requires_grad_(False)
 
-    N = FlowLMMainWrapper.NUM_LAYERS
+    N = wrapper.NUM_LAYERS
     H = FlowLMMainWrapper.NUM_HEADS
     D = FlowLMMainWrapper.DIM_PER_HEAD
 
