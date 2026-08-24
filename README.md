@@ -1,4 +1,4 @@
-# PocketTTS.cpp
+# PocketTTS.cpp — Multilingual
 
 **The fastest open-source TTS engine with voice cloning that runs entirely on CPU.**
 
@@ -7,6 +7,12 @@ Single-file C++ inference runtime for [Pocket TTS](https://github.com/kyutai-lab
 One file (`pocket_tts.cpp`), no frameworks, no Python dependency at runtime.
 
 **9.2x realtime** (RTFx) with **30ms time-to-first-audio** on a Ryzen 7 3800X, INT8 precision.
+
+> **Multilingual fork note:** This fork adds support for the newer Kyutai language bundles
+> (german, english_2026-04, italian, french_24l, spanish, portuguese, …) which require
+> `insert_bos_before_voice` conditioning. See [Multilingual support](#multilingual-support).
+> Upstream `PocketTTS.cpp` by [VolgaGerm](https://github.com/VolgaGerm/PocketTTS.cpp)
+> targets the older English-only `b6369a24` model and does not need this step.
 
 ## Features
 
@@ -18,6 +24,73 @@ One file (`pocket_tts.cpp`), no frameworks, no Python dependency at runtime.
 - **INT8 / FP32 precision** — INT8 by default for ~4x smaller models at comparable quality
 - **Built-in profiler** — `--profile` flag for per-operation timing
 - **OpenAI-compatible API** — drop-in replacement for `/v1/audio/speech` endpoint
+
+## Multilingual support
+
+Kyutai's current language bundles (`german`, `english_2026-04`, `italian`,
+`french_24l`, `spanish`, `portuguese`, …) changed voice conditioning: a learned
+BOS embedding must be prepended to the voice embeddings before conditioning
+(`insert_bos_before_voice`). Without it these models stop after ~0.2 seconds.
+
+This fork handles that automatically:
+
+1. **Export** any upstream language bundle (requires a Hugging Face token whose
+   account has accepted the [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts)
+   gate):
+
+   ```shell
+   .venv-export/bin/python export_onnx.py --language german        --output-dir models_de
+   .venv-export/bin/python export_onnx.py --language english_2026-04 --output-dir models_en
+   .venv-export/bin/python export_onnx.py --language italian       --output-dir models_it
+   .venv-export/bin/python export_onnx.py --language french_24l    --output-dir models_fr
+   ```
+
+   The exporter downloads `<language>/model.safetensors`, `<language>/tokenizer.model`
+   and exports FP32 + INT8 ONNX graphs into the output directory.
+
+2. **Run** pointing at the bundle directory. The BOS embedding
+   (`bos_before_voice.npy`) is auto-detected inside `--models-dir`; older
+   English-only `b6369a24` exports without the file behave exactly like upstream:
+
+   ```shell
+   ./pocket-tts --models-dir models_de --tokenizer models_de/tokenizer.model \
+     --voices-dir voices_de "Guten Tag!" juergen.wav output.wav
+   ```
+
+3. **Serve** one HTTP instance per language (each bundle owns its tokenizer and
+   KV-cache layout):
+
+   ```shell
+   ./pocket-tts --server --port 8091 --models-dir models_de --tokenizer models_de/tokenizer.model --voices-dir voices_de &
+   ./pocket-tts --server --port 8092 --models-dir models_en --tokenizer models_en/tokenizer.model --voices-dir voices_en &
+   ```
+
+### Measured German performance (Intel i5-12600K, INT8, 8 threads)
+
+| Test | Result |
+|---|---|
+| CLI single stream | RTFx 2.9 – 4.7x |
+| `/v1/audio/speech` | 4.4 s audio in 0.93 s (RTFx 4.8x) |
+| `/tts` streaming PCM | 3.1 s audio in 0.53 s |
+
+Whisper-small round-trip WER on German samples: 8–13%.
+
+### Built-in voice source clips
+
+The Kyutai built-in voices map to source recordings in
+[kyutai/tts-voices](https://huggingface.co/kyutai/tts-voices) — download the WAV
+for a voice and drop it into your voices directory:
+
+| Voice | Source clip |
+|---|---|
+| alba | `alba-mackenna/casual.wav` |
+| anna | `vctk/p228_023_enhanced.wav` |
+| cosette | `expresso/ex04-ex02_confused_001_channel1_499s.wav` |
+| eponine | `vctk/p262_023_enhanced.wav` |
+| fantine | `vctk/p244_023_enhanced.wav` |
+| jean | `ears/p010/freeform_speech_01_enhanced.wav` |
+| vera | `vctk/p229_023_enhanced.wav` |
+| … | see `_ORIGINS_OF_PREDEFINED_VOICES` in upstream `pocket_tts/utils/utils.py` |
 
 ## Requirements
 

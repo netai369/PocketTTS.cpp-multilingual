@@ -1192,6 +1192,11 @@ def run_validation(model: TTSModel, onnx_dir: Path, int8: bool = False):
 def main():
     parser = argparse.ArgumentParser(description="PocketTTS ONNX Export, Quantize & Validate")
     parser.add_argument("--output-dir", default="./models", help="Output directory")
+    parser.add_argument("--language", default=None,
+                        help="Language bundle from the upstream pocket-tts package "
+                             "(e.g. german, english_2026-04). Downloads gated weights "
+                             "from kyutai/pocket-tts using HF_TOKEN or ~/.cache/huggingface/token. "
+                             "Overrides --weights/--config naming below.")
     parser.add_argument("--export", nargs="+",
                         default=["all"],
                         choices=["all", "encoder", "text", "main", "flow", "decoder"],
@@ -1234,22 +1239,66 @@ def main():
                 print()
 
     # Download weights (cached, only needed for export)
-    weights_file = cache_dir / "tts_b6369a24.safetensors"
-    if not weights_file.exists():
-        print("\nDownloading weights...")
-        _download(f"{HF_BASE}/tts_b6369a24.safetensors", weights_file)
-        print(f"  ✓ {weights_file}")
+    if args.language:
+        import os
+        token = os.environ.get("HF_TOKEN", "")
+        if not token:
+            token_file = Path.home() / ".cache" / "huggingface" / "token"
+            if token_file.exists():
+                token = token_file.read_text().strip()
+        hf_lang_base = f"https://huggingface.co/kyutai/pocket-tts/resolve/main/languages/{args.language}"
+        auth_headers = {"User-Agent": "pocket-tts-export"}
+        if token:
+            auth_headers["Authorization"] = f"Bearer {token}"
 
-    # Download tokenizer (needed at runtime)
-    tokenizer_file = output_dir / "tokenizer.model"
-    if not tokenizer_file.exists():
-        print("Downloading tokenizer...")
-        _download(f"{HF_BASE}/tokenizer.model", tokenizer_file)
-        print(f"  ✓ {tokenizer_file}")
+        def _download_auth(url: str, dest: Path):
+            from urllib.request import urlopen, Request
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            req = Request(url, headers=auth_headers)
+            with urlopen(req) as resp, open(dest, "wb") as f:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                while chunk := resp.read(1 << 20):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = downloaded * 100 // total
+                        print(f"\r  {pct}% ({downloaded >> 20}/{total >> 20} MB)", end="", flush=True)
+                if total:
+                    print()
+
+        weights_file = cache_dir / f"tts_{args.language}.safetensors"
+        if not weights_file.exists():
+            print(f"\nDownloading {args.language} weights (gated)...")
+            _download_auth(f"{hf_lang_base}/model.safetensors", weights_file)
+            print(f"  ✓ {weights_file}")
+
+        tokenizer_file = output_dir / "tokenizer.model"
+        if not tokenizer_file.exists():
+            print("Downloading tokenizer...")
+            _download_auth(f"{hf_lang_base}/tokenizer.model", tokenizer_file)
+            print(f"  ✓ {tokenizer_file}")
+    else:
+        weights_file = cache_dir / "tts_b6369a24.safetensors"
+        if not weights_file.exists():
+            print("\nDownloading weights...")
+            _download(f"{HF_BASE}/tts_b6369a24.safetensors", weights_file)
+            print(f"  ✓ {weights_file}")
+
+        # Download tokenizer (needed at runtime)
+        tokenizer_file = output_dir / "tokenizer.model"
+        if not tokenizer_file.exists():
+            print("Downloading tokenizer...")
+            _download(f"{HF_BASE}/tokenizer.model", tokenizer_file)
+            print(f"  ✓ {tokenizer_file}")
 
     # Build config pointing at local weights
     import pocket_tts as _ptt
-    config_path = Path(_ptt.__file__).parent / "config" / "b6369a24.yaml"
+    if args.language:
+        config_name = args.language
+    else:
+        config_name = "b6369a24"
+    config_path = Path(_ptt.__file__).parent / "config" / f"{config_name}.yaml"
     if args.config:
         config_path = Path(args.config)
     config = load_config(config_path)

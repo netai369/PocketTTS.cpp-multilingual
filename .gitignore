@@ -17,6 +17,9 @@ pocket-tts
 # ONNX models (too large for git — download from HuggingFace)
 models/*.onnx
 
+# Multilingual model bundles (german, english_2026-04, italian, french_24l, ...)
+models_*/
+
 # Tokenizer model (bundled with ONNX models)
 models/tokenizer.model
 
@@ -28,9 +31,11 @@ voices/
 
 # Python virtual environment
 .venv/
+.venv-export/
 
 # Export script weight cache
 models/.cache/
+models_*/.cache/
 
 # Editor / OS
 .vscode/

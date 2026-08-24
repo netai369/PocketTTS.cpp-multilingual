@@ -162,6 +162,7 @@ struct TensorI64 {
 struct Config {
     std::string models_dir = "models", tokenizer_path = "models/tokenizer.model";
     std::string voices_dir = "voices";
+    std::string bos_file;       // auto: <models_dir>/bos_before_voice.npy if present
     std::string precision = "int8";
     float temperature = 0.7f;
     float eos_threshold = -4.0f;
@@ -179,6 +180,67 @@ struct AudioData {
 };
 
 using StreamCallback = std::function<bool(const float*, size_t)>;
+
+// Minimal NumPy .npy reader for float32 little-endian arrays (v1.0 headers).
+// Used for bos_before_voice.npy shipped with newer multilingual models.
+static bool load_npy_float32(const std::string& path, Tensor& out, bool verbose = false) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    char magic[6] = {0};
+    f.read(magic, 6);
+    if (std::memcmp(magic, "\x93NUMPY", 6) != 0) return false;
+    uint8_t ver[2];
+    f.read(reinterpret_cast<char*>(ver), 2);
+    if (ver[0] != 1) return false;  // only v1.0 header layout
+    uint16_t hlen = 0;
+    f.read(reinterpret_cast<char*>(&hlen), 2);
+    std::string header(hlen, '\0');
+    f.read(header.data(), hlen);
+    if (!f) return false;
+    // Parse the dict: {'descr': '<f4', 'fortran_order': False, 'shape': (1, 1, 1024), }
+    auto extract = [&](const std::string& key) -> std::string {
+        auto kpos = header.find("'" + key + "'");
+        if (kpos == std::string::npos) return "";
+        auto cpos = header.find(':', kpos);
+        if (cpos == std::string::npos) return "";
+        auto vstart = header.find_first_not_of(" \t", cpos + 1);
+        if (vstart == std::string::npos) return "";
+        // Tuple values like (1, 1, 1024) extend to their closing parenthesis.
+        char open = header[vstart];
+        if (open == '(' || open == '[') {
+            char close = (open == '(') ? ')' : ']';
+            auto vend = header.find(close, vstart);
+            if (vend == std::string::npos) return "";
+            return header.substr(vstart, vend - vstart + 1);
+        }
+        auto vend = header.find_first_of(",}", vstart);
+        if (vend == std::string::npos) vend = header.size();
+        return header.substr(vstart, vend - vstart);
+    };
+    if (extract("descr").find("f4") == std::string::npos) return false;
+    if (extract("fortran_order") != "False") return false;
+    std::string shape_s = extract("shape");
+    std::vector<int64_t> shape;
+    for (char& c : shape_s)
+        if (c == '(' || c == ')') c = ' ';
+    size_t pos = 0;
+    while (pos < shape_s.size()) {
+        auto comma = shape_s.find(',', pos);
+        std::string tok = shape_s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        try { shape.push_back(std::stoll(tok)); } catch (...) { break; }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    if (shape.empty()) return false;
+    int64_t n = 1;
+    for (auto d : shape) n *= d;
+    Tensor r(shape);
+    f.read(reinterpret_cast<char*>(r.data.data()), n * sizeof(float));
+    if (!f) return false;
+    out = std::move(r);
+    if (verbose) std::cerr << "  Loaded BOS-before-voice: " << path << "\n";
+    return true;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Utilities
@@ -1398,6 +1460,16 @@ public:
     explicit PocketTTS(const Config& cfg = {}) : cfg_(cfg) {
         rng::seed(uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
         tok_ = std::make_unique<Tokenizer>(cfg_.tokenizer_path);
+
+        // BOS-before-voice: newer models (english_2026-04, german, ...) require
+        // a learned embedding prepended to voice embeddings before conditioning.
+        // Older b6369a24 exports ship no such file -> behavior stays disabled.
+        {
+            std::string p = cfg_.bos_file.empty()
+                ? cfg_.models_dir + "/bos_before_voice.npy"
+                : cfg_.bos_file;
+            load_npy_float32(p, bos_before_voice_, cfg_.verbose);
+        }
         
         // Thread budget: --threads sets the total. During pipelined streaming,
         // the AR generator and Mimi decoder run simultaneously, so we split the
@@ -1548,7 +1620,22 @@ public:
     }
     
     // ── Voice Encoding ──────────────────────────────────────────────────────
-    
+
+    Tensor maybe_prepend_bos(Tensor t) {
+        if (bos_before_voice_.numel() == 0) return t;
+        if (t.shape.size() < 2) return t;
+        std::vector<int64_t> ns = t.shape;
+        ns[1] += 1;
+        Tensor r(ns);
+        const size_t bn = bos_before_voice_.data.size();
+        std::memcpy(r.data.data(), bos_before_voice_.data.data(), bn * sizeof(float));
+        std::memcpy(r.data.data() + bn, t.data.data(), t.data.size() * sizeof(float));
+        if (cfg_.verbose)
+            std::cerr << "  BOS prepended: voice " << t.shape[1] << " -> " << ns[1]
+                      << " frames (bos " << bn << " floats)\n";
+        return r;
+    }
+
     Tensor encode_voice(const std::string& path) {
         auto timer = g_prof.time("encode_voice");
         
@@ -1563,7 +1650,7 @@ public:
                     if (cfg_.verbose) {
                         std::cerr << "  Loaded cached embedding: " << cache_path << "\n";
                     }
-                    return Tensor(std::move(data), std::move(shape));
+                    return maybe_prepend_bos(Tensor(std::move(data), std::move(shape)));
                 }
             }
         }
@@ -1603,8 +1690,8 @@ public:
                 }
             }
         }
-        
-        return r;
+
+        return maybe_prepend_bos(std::move(r));
     }
     
     // ── Public API ──────────────────────────────────────────────────────────
@@ -1634,6 +1721,7 @@ private:
     Config cfg_;
     std::unique_ptr<OrtSession> enc_, txt_, main_, flow_, dec_;
     std::unique_ptr<Tokenizer> tok_;
+    Tensor bos_before_voice_;  // [1,1,1024] prepended to voice embeddings (new models)
     std::unique_ptr<StatefulRunner> main_runner_;
     std::unique_ptr<StatefulRunner> dec_runner_;  // reused across stream() calls
     std::vector<std::pair<float, float>> st_values_;
@@ -2708,6 +2796,9 @@ int main(int argc, char* argv[]) {
                 "  --models-dir <path>      ONNX models directory (default: models)\n"
                 "  --voices-dir <path>      Voice samples directory (default: voices)\n"
                 "  --tokenizer <path>       Tokenizer path (default: models/tokenizer.model)\n"
+                "  --bos <path>             BOS-before-voice embedding .npy (default: auto-detect\n"
+                "                           <models_dir>/bos_before_voice.npy; required by newer\n"
+                "                           multilingual models such as german/english_2026-04)\n"
                 "  --eos-threshold <float>  EOS detection threshold (default: -4.0)\n"
                 "  --noise-clamp <float>    Noise clamp value (default: 0, disabled)\n"
                 "  --eos-extra <int>        Extra frames after EOS (default: -1, auto)\n"
@@ -2730,6 +2821,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--models-dir") cfg.models_dir = next();
         else if (a == "--voices-dir") cfg.voices_dir = next();
         else if (a == "--tokenizer") cfg.tokenizer_path = next();
+        else if (a == "--bos") cfg.bos_file = next();
         else if (a == "--eos-threshold") cfg.eos_threshold = std::stof(next());
         else if (a == "--noise-clamp") cfg.noise_clamp = std::stof(next());
         else if (a == "--eos-extra") cfg.eos_extra_frames = std::stoi(next());
