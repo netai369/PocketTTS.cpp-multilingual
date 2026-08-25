@@ -39,6 +39,7 @@
 
 #include <sys/stat.h>
 #include <csignal>
+#include <map>
 
 // ── External Libraries ──────────────────────────────────────────────────────
 
@@ -588,7 +589,7 @@ static uint64_t hash_file(const std::string& path, uint64_t h) {
 }
 
 // Bump when conditioning or cache semantics change; invalidates ALL old entries.
-static constexpr const char* CACHE_VERSION = "cv3";
+static constexpr const char* CACHE_VERSION = "cv4";
 
 // Derive cache file path: voices/.cache/{stem}[_{fingerprint}].{ext}
 // ext = "emb" for voice embeddings, "kv" for KV state snapshots.
@@ -825,9 +826,20 @@ struct StateBufferIO {
     std::vector<ONNXTensorElementDataType> types;
     std::vector<std::string> names;
     std::vector<bool> is_dynamic;
+    std::vector<std::string> fill_specs;
     int current_buf = 0;
     
-    void init(OrtSession& s) {
+    // Synthesize fill semantics from model metadata when a bundle ships no
+    // manifest: float states spanning context length 1000 at dim 2 are KV
+    // caches that require NaN init ("no history"); bool flags start true.
+    static std::string synth_fill(ONNXTensorElementDataType t, const std::vector<int64_t>& sh) {
+        bool fl = (t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
+        if (fl && sh.size() >= 4 && sh[2] == 1000) return "nan";
+        if (t == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) return "ones";
+        return "";
+    }
+
+    void init(OrtSession& s, const std::map<std::string, std::string>* fills = nullptr) {
         const auto& in_names = s.input_names();
         const auto& in_shapes = s.input_shapes();
         const auto& in_types = s.input_types();
@@ -850,20 +862,36 @@ struct StateBufferIO {
             for (auto d : sh) sz *= (d > 0 ? d : 1);
             size_t alloc = dynamic ? 0 : sz;
             
+            // Bundle manifests may require non-zero initial fill ("nan" KV
+            // caches, "ones" first-frame flags); synthesize when absent.
+            std::string fill;
+            if (fills) {
+                auto it = fills->find(in_names[i]);
+                if (it != fills->end()) fill = it->second;
+            } else {
+                fill = synth_fill(in_types[i], sh);
+            }
+            fill_specs.push_back(fill);
+            float fv = (fill == "nan") ? std::numeric_limits<float>::quiet_NaN()
+                     : (fill == "ones") ? 1.0f : 0.0f;
+            uint16_t hv = (fill == "nan") ? uint16_t(0x7E00)
+                        : (fill == "ones") ? uint16_t(0x3C00) : uint16_t(0);
+            uint8_t bv = (fill == "ones") ? 1 : 0;
+            
             for (int b = 0; b < 2; ++b) {
                 if (in_types[i] == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
                     i64[b].push_back(std::vector<int64_t>(alloc, 0));
                     f32[b].push_back({}); f16[b].push_back({}); b8[b].push_back({});
                 } else if (in_types[i] == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) {
-                    b8[b].push_back(std::vector<uint8_t>(alloc, 0));
+                    b8[b].push_back(std::vector<uint8_t>(alloc, bv));
                     f32[b].push_back({}); f16[b].push_back({}); i64[b].push_back({});
                 } else if (in_types[i] == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
                     // Single-buffered: only buffer 0 is allocated.
                     // Both input and output bind to buffer 0, enabling in-place scatter.
-                    f16[b].push_back(b == 0 ? std::vector<uint16_t>(alloc, 0) : std::vector<uint16_t>());
+                    f16[b].push_back(b == 0 ? std::vector<uint16_t>(alloc, hv) : std::vector<uint16_t>());
                     f32[b].push_back({}); i64[b].push_back({}); b8[b].push_back({});
                 } else {
-                    f32[b].push_back(std::vector<float>(alloc, 0.0f));
+                    f32[b].push_back(std::vector<float>(alloc, fv));
                     f16[b].push_back({}); i64[b].push_back({}); b8[b].push_back({});
                 }
             }
@@ -888,10 +916,16 @@ struct StateBufferIO {
                     f32[b][i].clear(); f16[0][i].clear();
                     i64[b][i].clear(); b8[b][i].clear();
                 } else {
-                    std::fill(f32[b][i].begin(), f32[b][i].end(), 0.0f);
-                    std::fill(f16[0][i].begin(), f16[0][i].end(), uint16_t(0));
+                    const std::string& fl = fill_specs.empty() ? "" : fill_specs[i];
+                    float fv = (fl == "nan") ? std::numeric_limits<float>::quiet_NaN()
+                             : (fl == "ones") ? 1.0f : 0.0f;
+                    uint16_t hv = (fl == "nan") ? uint16_t(0x7E00)
+                                : (fl == "ones") ? uint16_t(0x3C00) : uint16_t(0);
+                    std::fill(f32[b][i].begin(), f32[b][i].end(), fv);
+                    std::fill(f16[0][i].begin(), f16[0][i].end(), hv);
                     std::fill(i64[b][i].begin(), i64[b][i].end(), int64_t(0));
-                    std::fill(b8[b][i].begin(), b8[b][i].end(), uint8_t(0));
+                    std::fill(b8[b][i].begin(), b8[b][i].end(),
+                              (fl == "ones") ? uint8_t(1) : uint8_t(0));
                 }
             }
         }
@@ -1347,6 +1381,7 @@ struct StateBufferIO {
 
 class StatefulRunner {
     OrtSession& sess_;
+    const std::map<std::string, std::string>* fills_ = nullptr;
     Ort::MemoryInfo mem_;
     StateBufferIO state_;
     std::unique_ptr<Ort::IoBinding> binding_;
@@ -1363,9 +1398,10 @@ class StatefulRunner {
     std::vector<FP16Fixup> fp16_fixups_;
     
 public:
-    StatefulRunner(OrtSession& sess) 
-        : sess_(sess), mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
-        state_.init(sess);
+    StatefulRunner(OrtSession& sess, const std::map<std::string, std::string>* fills = nullptr) 
+        : sess_(sess), mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+          fills_(fills) {
+        state_.init(sess, fills);
         binding_ = std::make_unique<Ort::IoBinding>(sess_.session());
         
         // Discover fp16 cache → step counter associations.
@@ -1421,7 +1457,7 @@ public:
     // where shapes change between runs.
     void reinit() {
         state_ = StateBufferIO();
-        state_.init(sess_);
+        state_.init(sess_, fills_);
     }
     
     // Lightweight reset — zeroes existing buffers without reallocation.
@@ -1556,7 +1592,7 @@ public:
         // budget between them. Non-pipelined models (encoder, text conditioner)
         // get the full budget since they run alone.
         int cores = std::max(1, int(std::thread::hardware_concurrency()));
-        int total = cfg_.num_threads ? cfg_.num_threads : std::max(2, cores / 2);
+        int total = cfg_.num_threads ? cfg_.num_threads : 1;  // default 1: ORT multithreading causes nondeterministic degenerate runs
         // Balance threads so gen thread and decoder thread finish at roughly the same time.
         // AR is compute-dense per step; decoder has fewer but heavier calls.
         int threads_dec = std::max(1, total / 2);
@@ -1614,8 +1650,51 @@ public:
         flow_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/flow_lm_flow" + sfx + ".onnx", opts_ar, "flow_lm_flow" + sfx);
         dec_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/mimi_decoder" + sfx + ".onnx", opts_dec, "mimi_decoder" + sfx);
         
-        main_runner_ = std::make_unique<StatefulRunner>(*main_);
-        dec_runner_ = std::make_unique<StatefulRunner>(*dec_);
+        // Optional bundle.json manifests (KevinAHM/vlapky-style exports).
+        // Bundles without them get synthesized fills (see StateBufferIO::init).
+        {
+            std::ifstream bf(cfg_.models_dir + "/bundle.json");
+            if (bf) {
+                std::stringstream ss; ss << bf.rdbuf();
+                std::string j = ss.str();
+                auto parse_fills = [&](const char* key) {
+                    std::map<std::string, std::string> m;
+                    size_t kpos = j.find(std::string("\"") + key + "\"");
+                    if (kpos == std::string::npos) return m;
+                    size_t arr0 = j.find('[', kpos), arr1 = j.find(']', kpos);
+                    if (arr0 == std::string::npos || arr1 == std::string::npos || arr1 < arr0) return m;
+                    size_t pos = arr0;
+                    while (true) {
+                        size_t npos = j.find("\"input_name\"", pos + 1);
+                        if (npos == std::string::npos || npos > arr1) break;
+                        size_t q1 = j.find('"', j.find(':', npos) + 1);
+                        size_t q2 = j.find('"', q1 + 1);
+                        std::string iname = j.substr(q1 + 1, q2 - q1 - 1);
+                        std::string fill;
+                        size_t fpos = j.find("\"fill\"", npos);
+                        size_t obj_end = j.find('}', npos);
+                        if (fpos != std::string::npos && fpos < obj_end) {
+                            size_t fq1 = j.find('"', j.find(':', fpos) + 1);
+                            size_t fq2 = j.find('"', fq1 + 1);
+                            fill = j.substr(fq1 + 1, fq2 - fq1 - 1);
+                        }
+                        m[iname] = fill;
+                        pos = npos;
+                    }
+                    return m;
+                };
+                fills_flow_ = parse_fills("flow_lm_state_manifest");
+                fills_mimi_ = parse_fills("mimi_state_manifest");
+                if (cfg_.verbose)
+                    std::cerr << "  bundle.json: " << fills_flow_.size() << " flow / "
+                              << fills_mimi_.size() << " mimi state fills\n";
+            }
+        }
+        
+        main_runner_ = std::make_unique<StatefulRunner>(*main_,
+            fills_flow_.empty() ? nullptr : &fills_flow_);
+        dec_runner_ = std::make_unique<StatefulRunner>(*dec_,
+            fills_mimi_.empty() ? nullptr : &fills_mimi_);
         
         dt_ = 1.0f / cfg_.lsd_steps;
         st_values_.reserve(cfg_.lsd_steps);
@@ -2076,6 +2155,7 @@ private:
     std::unique_ptr<VoiceKVSnapshot> voice_kv_snap_;
     uint64_t voice_kv_hash_ = 0;
     std::string voice_kv_path_;
+    std::map<std::string, std::string> fills_flow_, fills_mimi_;
     
     static uint64_t voice_hash(const Tensor& v) {
         uint64_t h = 14695981039346656037ull;
@@ -2145,13 +2225,23 @@ AudioData PocketTTS::generate(const std::string& text, const Tensor& voice, int 
     if (sentences.empty()) sentences.push_back(text);
     sentences = pack_sentences(sentences);
     
+    // Hard-cap generation length per chunk from token count (mirrors the
+    // Python runtime's _estimate_max_gen_len): bounds degenerate rambles.
+    auto frame_cap = [&](const std::string& chunk) {
+        size_t words = 1;
+        for (char c : chunk) if (c == ' ') ++words;
+        double sec = double(words) / 2.4 + 2.0;   // ~2.4 spoken words/s + padding
+        int cap = int(std::ceil(sec * 12.5));     // frame_rate
+        return std::max(16, std::min(max_frames, cap));
+    };
+    
     if (sentences.size() == 1) {
         std::vector<float> samples;
         samples.reserve(max_frames * 2000);
         stream(sentences[0], voice, [&](const float* s, size_t n) {
             samples.insert(samples.end(), s, s + n);
             return true;
-        }, max_frames);
+        }, frame_cap(sentences[0]));
         return {std::move(samples), SR};
     }
     
@@ -2171,7 +2261,7 @@ AudioData PocketTTS::generate(const std::string& text, const Tensor& voice, int 
         stream(sentences[i], voice, [&](const float* s, size_t n) {
             chunk_samples.insert(chunk_samples.end(), s, s + n);
             return true;
-        }, max_frames);
+        }, frame_cap(sentences[i]));
         
         if (chunk_samples.empty()) continue;
         
@@ -3015,7 +3105,7 @@ int main(int argc, char* argv[]) {
     }
     
     try {
-        int threads = cfg.num_threads ? cfg.num_threads : std::max(2, int(std::thread::hardware_concurrency()) / 2);
+        int threads = cfg.num_threads ? cfg.num_threads : 1;  // default 1: see session setup note
         
         if (!stdout_output) {
             std::cerr << "Loading (precision=" << cfg.precision << ", threads=" << threads << ")...\n";
