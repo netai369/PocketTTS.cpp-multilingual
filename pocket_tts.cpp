@@ -172,6 +172,7 @@ struct Config {
     int max_tokens_per_chunk = 50;  // pack sentences up to this many tokens (matches upstream)
     int lead_in_ms = 250;       // leading silence before the first audio chunk
     int out_rate = 0;           // 0 = native codec rate (24 kHz); else resample output
+    bool peak_norm = false;     // normalize output peak to -1 dBFS
     bool verbose = false;
     bool voice_cache = true;
 };
@@ -204,6 +205,16 @@ static std::vector<float> resample_catmull(const std::vector<float>& in, int src
         out[i] = (float)(((a0 * frac + a1) * frac + a2) * frac + p1);
     }
     return out;
+}
+
+// Peak-normalize to -1 dBFS (0.891). No-op for silence.
+static void peak_normalize(std::vector<float>& x, float target = 0.891f) {
+    float peak = 0.0f;
+    for (float v : x) peak = std::max(peak, std::fabs(v));
+    if (peak > 1e-6f) {
+        float g = target / peak;
+        for (float& v : x) v *= g;
+    }
 }
 
 using StreamCallback = std::function<bool(const float*, size_t)>;
@@ -562,15 +573,57 @@ static bool mkdir_p(const std::string& path) {
     return ptt_mkdir(path.c_str()) == 0 || errno == EEXIST;
 }
 
-// Derive cache file path: voices/.cache/{stem}.{ext}
-// ext = "emb" for voice embeddings, "kv" for KV state snapshots
-static std::string get_cache_path(const std::string& voices_dir, const std::string& voice_path, const char* ext = "emb") {
+static uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ULL) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    while (n--) { h ^= *p++; h *= 1099511628211ULL; }
+    return h;
+}
+
+static uint64_t hash_file(const std::string& path, uint64_t h) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return fnv1a("missing", 7, h);
+    h = fnv1a(&st.st_size, sizeof(st.st_size), h);
+    h = fnv1a(&st.st_mtime, sizeof(st.st_mtime), h);
+    return h;
+}
+
+// Bump when conditioning or cache semantics change; invalidates ALL old entries.
+static constexpr const char* CACHE_VERSION = "cv3";
+
+// Derive cache file path: voices/.cache/{stem}[_{fingerprint}].{ext}
+// ext = "emb" for voice embeddings, "kv" for KV state snapshots.
+// When models_dir/precision are given, the key includes a fingerprint of the
+// relevant model files, the precision and the reference audio CONTENT — stale
+// entries from different bundles/precision/code versions can never match.
+static std::string get_cache_path(const std::string& voices_dir, const std::string& voice_path,
+                                  const char* ext = "emb",
+                                  const std::string& models_dir = "",
+                                  const std::string& precision = "") {
     std::string filename = voice_path;
     size_t slash = voice_path.find_last_of("/\\");
     if (slash != std::string::npos) filename = voice_path.substr(slash + 1);
     size_t dot = filename.rfind('.');
     if (dot != std::string::npos) filename = filename.substr(0, dot);
-    return voices_dir + "/.cache/" + filename + "." + ext;
+
+    std::string suffix = "";
+    if (!models_dir.empty()) {
+        std::string sfx = precision == "int8" ? "_int8" : "";
+        uint64_t h = fnv1a(CACHE_VERSION, strlen(CACHE_VERSION));
+        h = hash_file(models_dir + "/mimi_encoder.onnx", h);
+        h = hash_file(models_dir + "/text_conditioner.onnx", h);
+        h = hash_file(models_dir + "/flow_lm_main" + sfx + ".onnx", h);
+        h = fnv1a(precision.data(), precision.size(), h);
+        // Reference audio content (not just mtime — copies may keep mtimes).
+        std::ifstream vf(voice_path, std::ios::binary);
+        if (vf) {
+            char buf[65536];
+            while (vf.read(buf, sizeof buf) || vf.gcount() > 0)
+                h = fnv1a(buf, (size_t)vf.gcount(), h);
+        }
+        char b[9]; snprintf(b, sizeof b, "%08llx", (unsigned long long)h);
+        suffix = std::string("_") + b;
+    }
+    return voices_dir + "/.cache/" + filename + suffix + "." + ext;
 }
 
 static bool is_cache_valid(const std::string& voice_path, const std::string& cache_path) {
@@ -1667,7 +1720,7 @@ public:
         auto timer = g_prof.time("encode_voice");
         
         if (cfg_.voice_cache) {
-            std::string cache_path = cache::get_cache_path(cfg_.voices_dir, path);
+            std::string cache_path = cache::get_cache_path(cfg_.voices_dir, path, "emb", cfg_.models_dir, cfg_.precision);
             
             if (cache::is_cache_valid(path, cache_path)) {
                 auto cache_timer = g_prof.time("encode_voice.cache_load");
@@ -1710,7 +1763,7 @@ public:
         if (r.shape.size() < 3) r.reshape({1, r.shape[0], r.shape[1]});
         
         if (cfg_.voice_cache) {
-            std::string cache_path = cache::get_cache_path(cfg_.voices_dir, path);
+            std::string cache_path = cache::get_cache_path(cfg_.voices_dir, path, "emb", cfg_.models_dir, cfg_.precision);
             if (cache::save_embedding(cache_path, r.shape, r.data)) {
                 if (cfg_.verbose) {
                     std::cerr << "  Saved embedding cache: " << cache_path << "\n";
@@ -2046,7 +2099,7 @@ private:
         
         // Tier 2: disk cache hit
         if (cfg_.voice_cache && !voice_kv_path_.empty()) {
-            std::string kv_path = cache::get_cache_path(cfg_.voices_dir, voice_kv_path_, "kv");
+            std::string kv_path = cache::get_cache_path(cfg_.voices_dir, voice_kv_path_, "kv", cfg_.models_dir, cfg_.precision);
             std::string resolved = resolve_voice_path(voice_kv_path_);
             StateBufferIO::DiskSnapshot ds;
             if (cache::is_cache_valid(resolved, kv_path) && ds.load_from_disk(kv_path)) {
@@ -2065,7 +2118,7 @@ private:
         voice_kv_hash_ = vh;
         
         if (cfg_.voice_cache && !voice_kv_path_.empty()) {
-            std::string kv_path = cache::get_cache_path(cfg_.voices_dir, voice_kv_path_, "kv");
+            std::string kv_path = cache::get_cache_path(cfg_.voices_dir, voice_kv_path_, "kv", cfg_.models_dir, cfg_.precision);
             auto ds = main_runner_->snapshot_to_disk(*voice_kv_snap_);
             if (ds.save_to_disk(kv_path)) {
                 if (cfg_.verbose) std::cerr << "  Saved KV cache: " << kv_path << "\n";
@@ -2421,12 +2474,13 @@ class TTSServer {
     PocketTTS& tts_;
     int port_;
     int out_rate_ = 0;
+    bool peak_norm_ = false;
     ptt_socket_t server_fd_ = PTT_INVALID_SOCKET;
     std::mutex tts_mutex_;
     
 public:
-    TTSServer(PocketTTS& tts, int port, int out_rate = 0)
-        : tts_(tts), port_(port), out_rate_(out_rate) {}
+    TTSServer(PocketTTS& tts, int port, int out_rate = 0, bool peak_norm = false)
+        : tts_(tts), port_(port), out_rate_(out_rate), peak_norm_(peak_norm) {}
     
     ~TTSServer() {
         if (server_fd_ != PTT_INVALID_SOCKET && server_fd_ == g_server_fd) {
@@ -2717,6 +2771,7 @@ private:
                 double duration = audio.duration_sec();
                 std::cout << "  Done: " << std::fixed << std::setprecision(2) << duration << "s audio in " << elapsed << "s (RTFx: " << duration/elapsed << "x)\n";
                 
+                if (peak_norm_) pocket_tts::peak_normalize(audio.samples);
                 if (req_rate > 0 && req_rate != PocketTTS::SR) {
                     audio.samples = resample_catmull(audio.samples, PocketTTS::SR, req_rate);
                     audio.sample_rate = req_rate;
@@ -2915,6 +2970,7 @@ int main(int argc, char* argv[]) {
                 "  --verbose                Enable verbose output\n"
                 "  --lead-in-ms <ms>        Leading silence before first audio chunk (default: 250)\n"
                 "  --out-rate <hz>          Output sample rate (default: native 24000, e.g. 44100)\n"
+                "  --peak-norm              Normalize output peak to -1 dBFS\n"
                 "  --profile                Show profiling report with first-chunk latency\n"
                 "\nServer mode:\n"
                 "  --server                 Start HTTP server (models prewarmed on startup)\n"
@@ -2934,6 +2990,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--eos-extra") cfg.eos_extra_frames = std::stoi(next());
         else if (a == "--lead-in-ms") cfg.lead_in_ms = std::stoi(next());
         else if (a == "--out-rate") cfg.out_rate = std::stoi(next());
+        else if (a == "--peak-norm") cfg.peak_norm = true;
         else if (a == "--max-chunk-tokens") cfg.max_tokens_per_chunk = std::stoi(next());
         else if (a == "--first-chunk") cfg.first_chunk_frames = std::stoi(next());
         else if (a == "--max-chunk") cfg.max_chunk_frames = std::stoi(next());
@@ -2982,7 +3039,7 @@ int main(int argc, char* argv[]) {
             signal(SIGPIPE, SIG_IGN);
 #endif
             
-            pocket_tts::TTSServer server(tts, server_port, cfg.out_rate);
+            pocket_tts::TTSServer server(tts, server_port, cfg.out_rate, cfg.peak_norm);
             if (!server.start()) return 1;
             server.run();
         }
@@ -3045,6 +3102,7 @@ int main(int argc, char* argv[]) {
                     std::cerr << "  First chunk latency: " << std::fixed << std::setprecision(0) 
                               << first_chunk_latency << "ms\n";
                 }
+                if (cfg.peak_norm) pocket_tts::peak_normalize(audio.samples);
                 if (cfg.out_rate > 0 && cfg.out_rate != audio.sample_rate) {
                     audio.samples = pocket_tts::resample_catmull(audio.samples, audio.sample_rate, cfg.out_rate);
                     audio.sample_rate = cfg.out_rate;
