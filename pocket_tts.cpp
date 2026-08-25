@@ -31,6 +31,7 @@
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
+#include <dirent.h>
   #define ptt_mkdir(path) mkdir(path, 0755)
   #define ptt_close close
   typedef int ptt_socket_t;
@@ -542,6 +543,14 @@ static Profiler g_prof;
 // Debug logging: level 0=off, 1=requests/lifecycle, 2=details, 3=trace.
 // Controlled via --debug-level CLI flag or PTT_DEBUG environment variable.
 static int g_debug_level = 0;
+// Voice aliasing (POCKET_VOICE_MAP="nova=callirhoe,F2=algenib"): lets OpenAI-
+// style clients use their own voice names without a dedicated adapter. Unknown
+// names pass through so failures stay visible instead of silently changing
+// the speaker.
+static std::unordered_map<std::string, std::string> g_voice_alias;
+// Optional catch-all: unknown voices fall back to this reference instead of
+// failing the request (POCKET_DEFAULT_VOICE). Empty = strict 400 behaviour.
+static std::string g_default_voice;
 static std::mutex g_log_mu;
 #define PTT_DBG(lvl, msg) do { \
     if (g_debug_level >= (lvl)) { \
@@ -1583,7 +1592,9 @@ public:
 class PocketTTS {
 public:
     static constexpr int SR = 24000;
-    
+
+    const std::string& voices_dir() const { return cfg_.voices_dir; }
+
     explicit PocketTTS(const Config& cfg = {}) : cfg_(cfg) {
         rng::seed(uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
         tok_ = std::make_unique<Tokenizer>(cfg_.tokenizer_path);
@@ -1906,6 +1917,25 @@ private:
     // extension candidates appended (.wav/.mp3/.flac); absolute paths pass
     // through unchanged when they exist.
     std::string resolve_voice_path(const std::string& p) const {
+        std::string name = p;
+        if (!name.empty() && name[0] != '/') {
+            auto it = g_voice_alias.find(name);
+            if (it == g_voice_alias.end()) {
+                std::string low;
+                low.reserve(name.size());
+                for (char c : name)
+                    low.push_back(c >= 'A' && c <= 'Z' ? (char)(c + 32) : c);
+                it = g_voice_alias.find(low);
+            }
+            if (it != g_voice_alias.end()) {
+                PTT_DBG(2, "voice alias '" << name << "' -> '" << it->second << "'");
+                name = it->second;
+            } else if (!g_default_voice.empty()) {
+                PTT_DBG(2, "voice '" << name << "' unknown -> default '"
+                                       << g_default_voice << "'");
+                name = g_default_voice;
+            }
+        }
         auto try_candidates = [&](const std::string& base) {
             if (file_exists(base)) return base;
             if (base.find('.') == std::string::npos) {
@@ -1914,8 +1944,8 @@ private:
             }
             return base;
         };
-        if (!p.empty() && p[0] == '/') return try_candidates(p);
-        return try_candidates(cfg_.voices_dir + "/" + p);
+        if (!name.empty() && name[0] == '/') return try_candidates(name);
+        return try_candidates(cfg_.voices_dir + "/" + name);
     }
     
     const Tensor& get_voice(const std::string& p) {
@@ -2806,6 +2836,32 @@ private:
         if (req.method == "GET" && req.path == "/health") {
             send_response(client_fd, 200, "application/json", "{\"status\":\"ok\"}");
         }
+        else if (req.method == "GET" && req.path == "/v1/models") {
+            // OpenAI-style model list so clients can probe capabilities.
+            send_response(client_fd, 200, "application/json",
+                "{\"object\":\"list\",\"data\":[{\"id\":\"pocket-tts\",\"object\":\"model\","
+                "\"created\":1766700000,\"owned_by\":\"netai\"}]}");
+        }
+        else if (req.method == "GET" && req.path == "/v1/voices") {
+            // List available reference voices (file stems) from the voices dir.
+            std::string json = "[";
+            bool first = true;
+            if (DIR* d = opendir(tts_.voices_dir().c_str())) {
+                while (dirent* ent = readdir(d)) {
+                    std::string fn = ent->d_name;
+                    size_t dot = fn.find_last_of('.');
+                    if (dot == std::string::npos || dot == 0) continue;
+                    std::string ext = fn.substr(dot);
+                    if (ext != ".wav" && ext != ".mp3" && ext != ".flac") continue;
+                    if (!first) json += ",";
+                    json += "\"" + fn.substr(0, dot) + "\"";
+                    first = false;
+                }
+                closedir(d);
+            }
+            json += "]";
+            send_response(client_fd, 200, "application/json", json);
+        }
         else if (req.method == "POST" && req.path == "/tts") {
             std::string text = json_get_string(req.body, "text");
             std::string voice = json_get_string(req.body, "voice");
@@ -2904,10 +2960,33 @@ private:
             std::cout << "  [OpenAI] Generating: \"" << text << "\" with voice '" << voice << "' (format: " << format << ")\n";
             
             try {
+                // Degenerate-run guard: rare generations collapse into noise
+                // (sample-to-sample jump rate jumps from <7/s to >1900/s).
+                // Detect and regenerate once — the client never hears it.
+                auto looks_degenerate = [](const std::vector<float>& s) {
+                    if (s.empty()) return true;
+                    for (float v : s) if (!std::isfinite(v)) return true;
+                    double dur = (double)s.size() / PocketTTS::SR;
+                    if (dur < 0.05) return true;
+                    size_t jumps = 0;
+                    for (size_t i = 1; i < s.size(); ++i)
+                        if (std::fabs(s[i] - s[i-1]) > 0.366f) ++jumps;  // 12000/32767
+                    double rate = jumps / dur;
+                    if (rate > 50.0) {
+                        PTT_DBG(1, "degenerate output: " << (long long)jumps << " jumps in "
+                                  << dur << "s (" << (long long)rate << "/s)");
+                        return true;
+                    }
+                    return false;
+                };
                 AudioData audio;
                 {
                     std::lock_guard<std::mutex> lock(tts_mutex_);
                     audio = tts_.generate(text, voice);
+                    for (int attempt = 1; looks_degenerate(audio.samples) && attempt < 2; ++attempt) {
+                        std::cout << "  [guard] degenerate generation detected, retrying\n";
+                        audio = tts_.generate(text, voice);
+                    }
                 }
                 
                 auto end = std::chrono::high_resolution_clock::now();
@@ -3077,6 +3156,26 @@ static void signal_handler(int sig) {
 
 int main(int argc, char* argv[]) {
     if (const char* e = getenv("PTT_DEBUG")) pocket_tts::g_debug_level = atoi(e);
+    if (const char* e = getenv("POCKET_VOICE_MAP"); e && *e) {
+        std::string s(e);
+        auto trim = [](std::string v) {
+            size_t a = v.find_first_not_of(" \t");
+            size_t b = v.find_last_not_of(" \t");
+            return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+        };
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            size_t comma = s.find(',', pos);
+            std::string pair = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            size_t eq = pair.find('=');
+            if (eq != std::string::npos && eq > 0 && eq + 1 < pair.size())
+                pocket_tts::g_voice_alias[trim(pair.substr(0, eq))] = trim(pair.substr(eq + 1));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+    }
+    if (const char* e = getenv("POCKET_DEFAULT_VOICE"); e && *e)
+        pocket_tts::g_default_voice = e;
     pocket_tts::Config cfg;
     bool stdout_output = false;
     bool server_mode = false;
