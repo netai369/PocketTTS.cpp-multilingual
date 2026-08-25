@@ -2311,6 +2311,22 @@ struct HttpRequest {
     }
 };
 
+// Returns a numeric JSON field, or -1 when absent/not numeric.
+static double json_get_number(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return -1;
+    pos = json.find(':', pos);
+    if (pos == std::string::npos) return -1;
+    ++pos;
+    while (pos < json.size() && isspace((unsigned char)json[pos])) ++pos;
+    size_t start = pos;
+    if (pos < json.size() && (json[pos] == '-' || json[pos] == '+')) ++pos;
+    bool digits = false;
+    while (pos < json.size() && (isdigit((unsigned char)json[pos]) || json[pos] == '.')) { digits = true; ++pos; }
+    return digits ? std::stod(json.substr(start, pos - start)) : -1;
+}
+
 static std::string json_get_string(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);
@@ -2662,12 +2678,17 @@ private:
         }
         else if (req.method == "POST" && req.path == "/v1/audio/speech") {
             // OpenAI-compatible TTS endpoint
-            // Accepts: { "model": "...", "input": "...", "voice": "...", "response_format": "wav"|"pcm" }
+            // Accepts: { "model": "...", "input": "...", "voice": "...", "response_format": "wav"|"pcm",
+            //           "sample_rate": 24000|44100 (optional; default: server --out-rate or native 24 kHz) }
             // "model" and "speed" are accepted but ignored.
             std::string text = json_get_string(req.body, "input");
             std::string voice = json_get_string(req.body, "voice");
             std::string format = json_get_string(req.body, "response_format");
             if (format.empty()) format = "wav";
+            // Optional per-request output rate ("sample_rate": 44100); falls back to server default.
+            int req_rate = out_rate_;
+            double r = json_get_number(req.body, "sample_rate");
+            if (r > 0) req_rate = (int)r;
             
             if (text.empty() || voice.empty()) {
                 send_response(client_fd, 400, "application/json", 
@@ -2696,9 +2717,9 @@ private:
                 double duration = audio.duration_sec();
                 std::cout << "  Done: " << std::fixed << std::setprecision(2) << duration << "s audio in " << elapsed << "s (RTFx: " << duration/elapsed << "x)\n";
                 
-                if (out_rate_ > 0 && out_rate_ != PocketTTS::SR) {
-                    audio.samples = resample_catmull(audio.samples, PocketTTS::SR, out_rate_);
-                    audio.sample_rate = out_rate_;
+                if (req_rate > 0 && req_rate != PocketTTS::SR) {
+                    audio.samples = resample_catmull(audio.samples, PocketTTS::SR, req_rate);
+                    audio.sample_rate = req_rate;
                 }
                 if (format == "pcm") {
                     send_binary_response(client_fd,
