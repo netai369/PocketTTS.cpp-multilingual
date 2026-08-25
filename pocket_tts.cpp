@@ -171,6 +171,7 @@ struct Config {
     int eos_extra_frames = -1;  // -1 = auto-calculate from text length
     int max_tokens_per_chunk = 50;  // pack sentences up to this many tokens (matches upstream)
     int lead_in_ms = 250;       // leading silence before the first audio chunk
+    int out_rate = 0;           // 0 = native codec rate (24 kHz); else resample output
     bool verbose = false;
     bool voice_cache = true;
 };
@@ -180,6 +181,30 @@ struct AudioData {
     int sample_rate = 24000;
     float duration_sec() const { return float(samples.size()) / sample_rate; }
 };
+
+// Catmull-Rom interpolation for output-rate conversion (e.g. 24 kHz -> 44.1 kHz).
+// Note: upsampling cannot restore spectral content above the native Nyquist
+// frequency; it eases playback pipelines expecting higher rates.
+static std::vector<float> resample_catmull(const std::vector<float>& in, int src_rate, int dst_rate) {
+    if (src_rate == dst_rate || in.empty()) return in;
+    double ratio = double(dst_rate) / src_rate;
+    size_t out_n = size_t(double(in.size()) * ratio);
+    std::vector<float> out(out_n, 0.0f);
+    for (size_t i = 0; i < out_n; ++i) {
+        double t = double(i) / ratio;
+        size_t i1 = (size_t)t;
+        double frac = t - double(i1);
+        size_t i0 = i1 ? i1 - 1 : 0;
+        size_t i2 = std::min(i1 + 1, in.size() - 1);
+        size_t i3 = std::min(i1 + 2, in.size() - 1);
+        double p0 = in[i0], p1 = in[i1], p2 = in[i2], p3 = in[i3];
+        double a0 = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+        double a1 = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+        double a2 = -0.5 * p0 + 0.5 * p2;
+        out[i] = (float)(((a0 * frac + a1) * frac + a2) * frac + p1);
+    }
+    return out;
+}
 
 using StreamCallback = std::function<bool(const float*, size_t)>;
 
@@ -2379,11 +2404,13 @@ static std::string json_get_string(const std::string& json, const std::string& k
 class TTSServer {
     PocketTTS& tts_;
     int port_;
+    int out_rate_ = 0;
     ptt_socket_t server_fd_ = PTT_INVALID_SOCKET;
     std::mutex tts_mutex_;
     
 public:
-    TTSServer(PocketTTS& tts, int port) : tts_(tts), port_(port) {}
+    TTSServer(PocketTTS& tts, int port, int out_rate = 0)
+        : tts_(tts), port_(port), out_rate_(out_rate) {}
     
     ~TTSServer() {
         if (server_fd_ != PTT_INVALID_SOCKET && server_fd_ == g_server_fd) {
@@ -2669,11 +2696,16 @@ private:
                 double duration = audio.duration_sec();
                 std::cout << "  Done: " << std::fixed << std::setprecision(2) << duration << "s audio in " << elapsed << "s (RTFx: " << duration/elapsed << "x)\n";
                 
+                if (out_rate_ > 0 && out_rate_ != PocketTTS::SR) {
+                    audio.samples = resample_catmull(audio.samples, PocketTTS::SR, out_rate_);
+                    audio.sample_rate = out_rate_;
+                }
                 if (format == "pcm") {
-                    send_binary_response(client_fd, "audio/pcm",
+                    send_binary_response(client_fd,
+                        "audio/pcm;rate=" + std::to_string(audio.sample_rate),
                         audio.samples.data(), audio.samples.size() * sizeof(float));
                 } else {
-                    auto wav = wav_encode(audio.samples.data(), audio.samples.size(), PocketTTS::SR);
+                    auto wav = wav_encode(audio.samples.data(), audio.samples.size(), audio.sample_rate);
                     send_binary_response(client_fd, "audio/wav", wav);
                 }
             } catch (const std::exception& e) {
@@ -2860,6 +2892,8 @@ int main(int argc, char* argv[]) {
                 "\nOutput:\n"
                 "  --stdout                 Output raw f32le PCM to stdout (for piping)\n"
                 "  --verbose                Enable verbose output\n"
+                "  --lead-in-ms <ms>        Leading silence before first audio chunk (default: 250)\n"
+                "  --out-rate <hz>          Output sample rate (default: native 24000, e.g. 44100)\n"
                 "  --profile                Show profiling report with first-chunk latency\n"
                 "\nServer mode:\n"
                 "  --server                 Start HTTP server (models prewarmed on startup)\n"
@@ -2878,6 +2912,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--noise-clamp") cfg.noise_clamp = std::stof(next());
         else if (a == "--eos-extra") cfg.eos_extra_frames = std::stoi(next());
         else if (a == "--lead-in-ms") cfg.lead_in_ms = std::stoi(next());
+        else if (a == "--out-rate") cfg.out_rate = std::stoi(next());
         else if (a == "--max-chunk-tokens") cfg.max_tokens_per_chunk = std::stoi(next());
         else if (a == "--first-chunk") cfg.first_chunk_frames = std::stoi(next());
         else if (a == "--max-chunk") cfg.max_chunk_frames = std::stoi(next());
@@ -2926,7 +2961,7 @@ int main(int argc, char* argv[]) {
             signal(SIGPIPE, SIG_IGN);
 #endif
             
-            pocket_tts::TTSServer server(tts, server_port);
+            pocket_tts::TTSServer server(tts, server_port, cfg.out_rate);
             if (!server.start()) return 1;
             server.run();
         }
@@ -2989,8 +3024,12 @@ int main(int argc, char* argv[]) {
                     std::cerr << "  First chunk latency: " << std::fixed << std::setprecision(0) 
                               << first_chunk_latency << "ms\n";
                 }
+                if (cfg.out_rate > 0 && cfg.out_rate != audio.sample_rate) {
+                    audio.samples = pocket_tts::resample_catmull(audio.samples, audio.sample_rate, cfg.out_rate);
+                    audio.sample_rate = cfg.out_rate;
+                }
                 pocket_tts::PocketTTS::save_audio(audio, output);
-                std::cerr << "  Saved: " << output << "\n";
+                std::cerr << "  Saved: " << output << " @ " << audio.sample_rate << "Hz\n";
             } else {
                 std::cerr << "  " << std::fixed << std::setprecision(2)
                           << duration << "s audio in " << gen_time << "s (RTFx: " << duration / gen_time << "x)\n";
