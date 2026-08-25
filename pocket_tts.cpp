@@ -854,7 +854,15 @@ struct StateBufferIO {
     // caches that require NaN init ("no history"); bool flags start true.
     static std::string synth_fill(ONNXTensorElementDataType t, const std::vector<int64_t>& sh) {
         bool fl = (t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
-        if (fl && sh.size() >= 4 && sh[2] == 1000) return "nan";
+        // KV caches carry the sequence dimension (=1000 frames); its INDEX
+        // depends on the export layout ([2,1,1000,h,d] vs [1,1000,h,d]), so
+        // scan instead of hardcoding position.
+        if (fl && sh.size() >= 3) {
+            for (int64_t d : sh) {
+                if (d == 1000 && sh.size() >= 4) return "nan";
+                if (d == 1000) return "nan";
+            }
+        }
         if (t == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) return "ones";
         return "";
     }
@@ -2961,8 +2969,10 @@ private:
             
             try {
                 // Degenerate-run guard: rare generations collapse into noise
-                // (sample-to-sample jump rate jumps from <7/s to >1900/s).
-                // Detect and regenerate once — the client never hears it.
+                // (sample-to-sample jump rate jumps from <7/s to >1900/s) or
+                // into a tonal drone (flow collapse locks a ~900 Hz tone;
+                // voiced-block ZCR then stays near-constant: cv<0.5 vs >=1.1
+                // for real speech). Detect both and regenerate once.
                 auto looks_degenerate = [](const std::vector<float>& s) {
                     if (s.empty()) return true;
                     for (float v : s) if (!std::isfinite(v)) return true;
@@ -2971,11 +2981,38 @@ private:
                     size_t jumps = 0;
                     for (size_t i = 1; i < s.size(); ++i)
                         if (std::fabs(s[i] - s[i-1]) > 0.366f) ++jumps;  // 12000/32767
-                    double rate = jumps / dur;
-                    if (rate > 50.0) {
+                    if (jumps / dur > 50.0) {
                         PTT_DBG(1, "degenerate output: " << (long long)jumps << " jumps in "
-                                  << dur << "s (" << (long long)rate << "/s)");
+                                  << dur << "s (" << (long long)(jumps/dur) << "/s)");
                         return true;
+                    }
+                    // Drone check: ZCR coefficient of variation over voiced
+                    // 20 ms blocks (rms floor 800/32767).
+                    const size_t blk = PocketTTS::SR / 50;
+                    const float e_floor = 800.f / 32767.f;
+                    std::vector<double> zs;
+                    for (size_t i = 0; i + blk <= s.size(); i += blk) {
+                        double e = 0;
+                        for (size_t j = i; j < i + blk; ++j) e += double(s[j]) * s[j];
+                        if (e / blk < double(e_floor) * e_floor) continue;
+                        size_t cr = 0;
+                        for (size_t j = i + 1; j < i + blk; ++j)
+                            if ((s[j] < 0.f) != (s[j-1] < 0.f)) ++cr;
+                        zs.push_back((double)cr / blk * PocketTTS::SR);
+                    }
+                    if (zs.size() >= 10) {
+                        std::vector<double> sorted_zs = zs;
+                        std::sort(sorted_zs.begin(), sorted_zs.end());
+                        double med = sorted_zs[sorted_zs.size()/2];
+                        if (med > 0) {
+                            double var = 0;
+                            for (double z : zs) var += (z - med) * (z - med);
+                            double cv = std::sqrt(var / zs.size()) / med;
+                            if (cv < 0.5) {
+                                PTT_DBG(1, "degenerate output: tonal lock (zcr cv=" << cv << ")");
+                                return true;
+                            }
+                        }
                     }
                     return false;
                 };
