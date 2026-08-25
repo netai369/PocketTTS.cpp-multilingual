@@ -539,6 +539,17 @@ struct Profiler {
 
 static Profiler g_prof;
 
+// Debug logging: level 0=off, 1=requests/lifecycle, 2=details, 3=trace.
+// Controlled via --debug-level CLI flag or PTT_DEBUG environment variable.
+static int g_debug_level = 0;
+static std::mutex g_log_mu;
+#define PTT_DBG(lvl, msg) do { \
+    if (g_debug_level >= (lvl)) { \
+        std::lock_guard<std::mutex> ptt_log_lock_(g_log_mu); \
+        std::cerr << "[dbg" << (lvl) << "] " << __func__ << ":" << __LINE__ << " " << msg << std::endl; \
+    } \
+} while(0)
+
 // ════════════════════════════════════════════════════════════════════════════
 // Disk Cache
 //
@@ -1889,18 +1900,34 @@ private:
     
     // ── Voice Resolution ────────────────────────────────────────────────────
     
+    static bool file_exists(const std::string& f) { return access(f.c_str(), R_OK) == 0; }
+
+    // Resolve a voice reference to an audio file. Bare names ("juergen") get
+    // extension candidates appended (.wav/.mp3/.flac); absolute paths pass
+    // through unchanged when they exist.
     std::string resolve_voice_path(const std::string& p) const {
-        if (!p.empty() && p[0] == '/') return p;
-        return cfg_.voices_dir + "/" + p;
+        auto try_candidates = [&](const std::string& base) {
+            if (file_exists(base)) return base;
+            if (base.find('.') == std::string::npos) {
+                for (const char* ext : {".wav", ".mp3", ".flac"})
+                    if (file_exists(base + ext)) return base + ext;
+            }
+            return base;
+        };
+        if (!p.empty() && p[0] == '/') return try_candidates(p);
+        return try_candidates(cfg_.voices_dir + "/" + p);
     }
     
     const Tensor& get_voice(const std::string& p) {
         voice_kv_path_ = p;
         auto it = vcache_.find(p);
-        if (it != vcache_.end()) return it->second;
+        if (it != vcache_.end()) { PTT_DBG(2, "voice '" << p << "' mem-cache hit"); return it->second; }
         
         std::string resolved = resolve_voice_path(p);
-        return vcache_[p] = encode_voice(resolved);
+        PTT_DBG(2, "voice '" << p << "' -> encoding " << resolved);
+        try {
+            return vcache_[p] = encode_voice(resolved);
+        } catch (...) { PTT_DBG(1, "encode_voice FAILED for " << resolved); throw; }
     }
     
     // ── Tokenization ────────────────────────────────────────────────────────
@@ -2286,15 +2313,25 @@ void PocketTTS::stream(const std::string& text, const std::string& voice, Stream
 }
 
 void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallback cb, int max_frames) {
+    PTT_DBG(2, "enter: text=" << text.size() << "B max_frames=" << max_frames);
     auto sentences = split_sentences(text);
     if (sentences.empty()) sentences.push_back(text);
     sentences = pack_sentences(sentences);
+    PTT_DBG(2, "chunks=" << sentences.size());
     
     for (size_t si = 0; si < sentences.size(); ++si) {
         auto [prepared, eos_extra] = prepare_text(sentences[si], cfg_.eos_extra_frames);
+        PTT_DBG(2, "chunk " << si << ": prepared=" << prepared.size() << "B eos_extra=" << eos_extra);
         if (prepared.empty()) continue;
-        auto gen = make_gen(voice, tokenize(prepared), max_frames, eos_extra);
+        // Hard-cap per chunk from word count; bounds degenerate rambles even
+        // when callers (e.g. the /tts server endpoint) bypass generate().
+        size_t words = 1;
+        for (char c : sentences[si]) if (c == ' ') ++words;
+        int cap = int(std::ceil((double(words) / 2.4 + 2.0) * 12.5));
+        int eff_max = std::max(16, std::min(max_frames, cap));
+        auto gen = make_gen(voice, tokenize(prepared), eff_max, eos_extra);
         dec_runner_->reset_state();  // zero existing buffers, no reallocation
+        PTT_DBG(2, "generator ready, decoding chunk " << si);
         
         // Pipelined: generator thread produces latent frames into a queue,
         // decoder (main thread) consumes them in chunks. The two ONNX sessions
@@ -2340,7 +2377,7 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
             {
                 std::unique_lock<std::mutex> lock(mtx);
                 cv.wait(lock, [&]{ return (int)queue.size() >= want || gen_done || aborted; });
-                if (aborted) break;
+                if (aborted) { PTT_DBG(1, "decode loop aborted"); break; }
                 
                 int take = gen_done ? (int)queue.size() : std::min((int)queue.size(), want);
                 for (int i = 0; i < take; ++i) {
@@ -2781,12 +2818,17 @@ private:
             auto start = std::chrono::high_resolution_clock::now();
             std::cout << "  Generating: \"" << text << "\" with voice '" << voice << "'\n";
             
+            PTT_DBG(1, "POST /tts text=" << text.size() << "B voice='" << voice << "'");
+            bool header_sent = false;
             try {
                 send_chunked_header(client_fd, "audio/pcm;rate=24000;encoding=float;bits=32");
+                header_sent = true;
+                PTT_DBG(2, "chunked header sent");
                 
                 bool first_chunk = true;
                 bool client_disconnected = false;
                 size_t total_samples = 0;
+                size_t chunk_count = 0;
                 
                 {
                     std::lock_guard<std::mutex> lock(tts_mutex_);
@@ -2794,17 +2836,19 @@ private:
                         if (first_chunk) {
                             auto now = std::chrono::high_resolution_clock::now();
                             double latency = std::chrono::duration<double, std::milli>(now - start).count();
-                            std::cout << "  First chunk latency: " << std::fixed << std::setprecision(0) << latency << "ms\n";
+                            PTT_DBG(1, "first audio chunk after " << (long long)latency << "ms");
                             first_chunk = false;
                         }
                         if (!send_chunk(client_fd, samples, n * sizeof(float))) {
+                            PTT_DBG(1, "send_chunk failed -> client disconnected");
                             client_disconnected = true;
                             return false; // triggers stream() abort path
                         }
-                        total_samples += n;
+                        total_samples += n; ++chunk_count;
                         return true;
                     });
                 }
+                PTT_DBG(1, "stream finished: " << chunk_count << " chunks, " << total_samples << " samples");
                 
                 if (client_disconnected) {
                     std::cout << "  Client disconnected during stream\n";
@@ -2817,7 +2861,17 @@ private:
                 double duration = double(total_samples) / PocketTTS::SR;
                 std::cout << "  Done: " << std::fixed << std::setprecision(2) << duration << "s audio in " << elapsed << "s (RTFx: " << duration/elapsed << "x)\n";
             } catch (const std::exception& e) {
-                send_response(client_fd, 400, "application/json", "{\"error\":\"" + std::string(e.what()) + "\"}");
+                std::cerr << "[tts-error] " << e.what() << std::endl;
+                PTT_DBG(2, "exception after header_sent=" << header_sent);
+                if (header_sent) {
+                    // Chunked response already started: terminate the stream
+                    // cleanly instead of emitting a second HTTP status line.
+                    const std::string msg = e.what();
+                    send_chunk(client_fd, msg.data(), msg.size());
+                    send_final_chunk(client_fd);
+                } else {
+                    send_response(client_fd, 400, "application/json", "{\"error\":\"" + std::string(e.what()) + "\"}");
+                }
             }
         }
         else if (req.method == "POST" && req.path == "/v1/audio/speech") {
@@ -3022,6 +3076,7 @@ static void signal_handler(int sig) {
 }
 
 int main(int argc, char* argv[]) {
+    if (const char* e = getenv("PTT_DEBUG")) pocket_tts::g_debug_level = atoi(e);
     pocket_tts::Config cfg;
     bool stdout_output = false;
     bool server_mode = false;
@@ -3061,6 +3116,7 @@ int main(int argc, char* argv[]) {
                 "  --lead-in-ms <ms>        Leading silence before first audio chunk (default: 250)\n"
                 "  --out-rate <hz>          Output sample rate (default: native 24000, e.g. 44100)\n"
                 "  --peak-norm              Normalize output peak to -1 dBFS\n"
+                "  --debug-level <0-3>      Debug logging (0=off, 1=reqs, 2=details, 3=trace; env PTT_DEBUG)\n"
                 "  --profile                Show profiling report with first-chunk latency\n"
                 "\nServer mode:\n"
                 "  --server                 Start HTTP server (models prewarmed on startup)\n"
@@ -3088,6 +3144,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--stdout") stdout_output = true;
         else if (a == "--verbose") cfg.verbose = true;
         else if (a == "--profile") pocket_tts::g_prof.enabled = true;
+        else if (a == "--debug-level") pocket_tts::g_debug_level = std::stoi(next());
         else if (a == "--server") server_mode = true;
         else if (a == "--port") server_port = std::stoi(next());
         else if (a[0] == '-') { std::cerr << "Unknown: " << a << "\n"; return 1; }
